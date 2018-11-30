@@ -4,64 +4,24 @@
 
 export interface BodyScrollOptions {
   reserveScrollBarGap?: boolean;
-  allowTouchMove?: (el: any) => boolean;
-}
-
-interface Lock {
-  targetElement: any;
-  options: BodyScrollOptions;
-}
-
-// Older browsers don't support event options, feature detect it.
-let hasPassiveEvents = false;
-if (typeof window !== 'undefined') {
-  const passiveTestOptions = {
-    get passive() {
-      hasPassiveEvents = true;
-      return undefined;
-    },
-  };
-  window.addEventListener('testPassive', null, passiveTestOptions);
-  window.removeEventListener('testPassive', null, passiveTestOptions);
 }
 
 const isIosDevice =
   typeof window !== 'undefined' &&
   window.navigator &&
   window.navigator.platform &&
-  /iP(ad|hone|od)/.test(window.navigator.platform);
+  /iPad|iPhone|iPod|(iPad Simulator)|(iPhone Simulator)|(iPod Simulator)/.test(window.navigator.platform);
 type HandleScrollEvent = TouchEvent;
 
-let locks: Array<Lock> = [];
-let documentListenerAdded: boolean = false;
+let firstTargetElement: any = null;
+let allTargetElements: [any] = [];
 let initialClientY: number = -1;
 let previousBodyOverflowSetting;
+let previousDocumentElementOverflowSetting;
 let previousBodyPaddingRight;
-
-// returns true if `el` should be allowed to receive touchmove events
-const allowTouchMove = (el: EventTarget): boolean =>
-  locks.some(lock => {
-    if (lock.options.allowTouchMove && lock.options.allowTouchMove(el)) {
-      return true;
-    }
-
-    return false;
-  });
 
 const preventDefault = (rawEvent: HandleScrollEvent): boolean => {
   const e = rawEvent || window.event;
-
-  // For the case whereby consumers adds a touchmove event listener to document.
-  // Recall that we do document.addEventListener('touchmove', preventDefault, { passive: false })
-  // in disableBodyScroll - so if we provide this opportunity to allowTouchMove, then
-  // the touchmove event on document will break.
-  if (allowTouchMove(e.target)) {
-    return true;
-  }
-
-  // Do not prevent if the event has more than one touch (usually meaning this is a multi touch gesture like pinch to zoom)
-  if (e.touches.length > 1) return true;
-
   if (e.preventDefault) e.preventDefault();
 
   return false;
@@ -85,7 +45,9 @@ const setOverflowHidden = (options?: BodyScrollOptions) => {
     // If previousBodyOverflowSetting is already set, don't set it again.
     if (previousBodyOverflowSetting === undefined) {
       previousBodyOverflowSetting = document.body.style.overflow;
+      previousDocumentElementOverflowSetting = document.documentElement.style.overflow;
       document.body.style.overflow = 'hidden';
+      document.documentElement.style.overflow = 'hidden';
     }
   });
 };
@@ -104,10 +66,12 @@ const restoreOverflowSetting = () => {
 
     if (previousBodyOverflowSetting !== undefined) {
       document.body.style.overflow = previousBodyOverflowSetting;
+      document.documentElement.style.overflow = previousDocumentElementOverflowSetting;
 
-      // Restore previousBodyOverflowSetting to undefined
+      // Restore previousBodyOverflowSetting/previousDocumentElementOverflowSetting to undefined
       // so setOverflowHidden knows it can be set again.
       previousBodyOverflowSetting = undefined;
+      previousDocumentElementOverflowSetting = undefined;
     }
   });
 };
@@ -119,10 +83,6 @@ const isTargetElementTotallyScrolled = (targetElement: any): boolean =>
 const handleScroll = (event: HandleScrollEvent, targetElement: any): boolean => {
   const clientY = event.targetTouches[0].clientY - initialClientY;
 
-  if (allowTouchMove(event.target)) {
-    return false;
-  }
-
   if (targetElement && targetElement.scrollTop === 0 && clientY > 0) {
     // element is at the top of its scroll
     return preventDefault(event);
@@ -133,29 +93,30 @@ const handleScroll = (event: HandleScrollEvent, targetElement: any): boolean => 
     return preventDefault(event);
   }
 
-  event.stopPropagation();
   return true;
 };
+
+const handlers = new Map();
 
 export const disableBodyScroll = (targetElement: any, options?: BodyScrollOptions): void => {
   if (isIosDevice) {
     // targetElement must be provided, and disableBodyScroll must not have been
     // called on this targetElement before.
-    if (!targetElement) {
-      // eslint-disable-next-line no-console
-      console.error(
-        'disableBodyScroll unsuccessful - targetElement must be provided when calling disableBodyScroll on IOS devices.'
-      );
-      return;
-    }
+    if (targetElement && !allTargetElements.includes(targetElement)) {
+      allTargetElements = [...allTargetElements, targetElement];
 
-    if (targetElement && !locks.some(lock => lock.targetElement === targetElement)) {
-      const lock = {
-        targetElement,
-        options: options || {},
-      };
+      handlers.set(targetElement, event => {
+        if (!targetElement.contains(event.target)) {
+          event.preventDefault();
+        }
+      });
 
-      locks = [...locks, lock];
+      document.body.addEventListener('touchstart', handlers.get(targetElement), {
+        passive: false,
+      });
+      document.body.addEventListener('touchmove', handlers.get(targetElement), {
+        passive: false,
+      });
 
       targetElement.ontouchstart = (event: HandleScrollEvent) => {
         if (event.targetTouches.length === 1) {
@@ -169,71 +130,59 @@ export const disableBodyScroll = (targetElement: any, options?: BodyScrollOption
           handleScroll(event, targetElement);
         }
       };
-
-      if (!documentListenerAdded) {
-        document.addEventListener('touchmove', preventDefault, hasPassiveEvents ? { passive: false } : undefined);
-        documentListenerAdded = true;
-      }
     }
   } else {
     setOverflowHidden(options);
-    const lock = {
-      targetElement,
-      options: options || {},
-    };
-
-    locks = [...locks, lock];
   }
+
+  if (!firstTargetElement) firstTargetElement = targetElement;
 };
 
 export const clearAllBodyScrollLocks = (): void => {
   if (isIosDevice) {
-    // Clear all locks ontouchstart/ontouchmove handlers, and the references
-    locks.forEach((lock: Lock) => {
-      lock.targetElement.ontouchstart = null;
-      lock.targetElement.ontouchmove = null;
+    handlers.forEach(handler => {
+      document.body.removeEventListener('touchstart', handler);
+      document.body.removeEventListener('touchmove', handler);
     });
+    handlers.clear();
 
-    if (documentListenerAdded) {
-      document.removeEventListener('touchmove', preventDefault, hasPassiveEvents ? { passive: false } : undefined);
-      documentListenerAdded = false;
-    }
+    // Clear all allTargetElements ontouchstart/ontouchmove handlers, and the references
+    allTargetElements.forEach((targetElement: any) => {
+      targetElement.ontouchstart = null;
+      targetElement.ontouchmove = null;
 
-    locks = [];
+      allTargetElements = [];
+    });
 
     // Reset initial clientY
     initialClientY = -1;
   } else {
     restoreOverflowSetting();
-    locks = [];
   }
+
+  firstTargetElement = null;
 };
 
 export const enableBodyScroll = (targetElement: any): void => {
   if (isIosDevice) {
-    if (!targetElement) {
-      // eslint-disable-next-line no-console
-      console.error(
-        'enableBodyScroll unsuccessful - targetElement must be provided when calling enableBodyScroll on IOS devices.'
-      );
-      return;
-    }
+    allTargetElements.forEach(target => {
+      if (targetElement === target) {
+        document.body.removeEventListener('touchstart', handlers.get(targetElement));
+        document.body.removeEventListener('touchmove', handlers.get(targetElement));
+        handlers.delete(targetElement);
+
+        if (targetElement === firstTargetElement) {
+          firstTargetElement = null;
+        }
+      }
+    });
 
     targetElement.ontouchstart = null;
     targetElement.ontouchmove = null;
 
-    locks = locks.filter(lock => lock.targetElement !== targetElement);
-
-    if (documentListenerAdded && locks.length === 0) {
-      document.removeEventListener('touchmove', preventDefault, hasPassiveEvents ? { passive: false } : undefined);
-
-      documentListenerAdded = false;
-    }
-  } else if (locks.length === 1 && locks[0].targetElement === targetElement) {
+    allTargetElements = allTargetElements.filter(elem => elem !== targetElement);
+  } else if (firstTargetElement === targetElement) {
     restoreOverflowSetting();
-
-    locks = [];
-  } else {
-    locks = locks.filter(lock => lock.targetElement !== targetElement);
+    firstTargetElement = null;
   }
 };
